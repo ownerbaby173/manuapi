@@ -1,17 +1,26 @@
 import { useState } from 'react';
-import { Copy, Check, Database, FileCode, Server, Shield } from 'lucide-react';
+import { Copy, Check, Database, FileCode, Server, Shield, Download, FileArchive, FileText } from 'lucide-react';
+import JSZip from 'jszip';
+import { saveAs } from 'file-saver';
 
 const phpFiles = [
   {
     id: 'config',
     name: 'config.php',
+    path: 'config.php',
     icon: <Database size={16} />,
-    description: 'Database Configuration',
+    description: 'Database Configuration & Helper Classes',
     code: `<?php
 // ============================================
 // API Verification System - Database Config
+// File: config.php
 // ============================================
 
+// Error reporting (disable in production)
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+
+// Database Configuration
 define('DB_HOST', 'localhost');
 define('DB_NAME', 'api_verification');
 define('DB_USER', 'root');
@@ -20,860 +29,888 @@ define('DB_CHARSET', 'utf8mb4');
 
 // API Settings
 define('API_VERSION', '1.0.0');
-define('RATE_LIMIT', 1000);        // requests per minute
-define('MAX_DEVICES', 5);          // max devices per license
-define('TOKEN_EXPIRY', 86400);     // 24 hours in seconds
-define('SECRET_KEY', 'your-secret-key-here');
+define('RATE_LIMIT', 1000);          // requests per minute
+define('MAX_DEVICES', 5);            // max devices per license
+define('TOKEN_EXPIRY', 86400);       // 24 hours in seconds
+define('SECRET_KEY', 'change-this-secret-key-2024');
+define('LOG_RETENTION_DAYS', 30);
+
+// Paths
+define('BASE_PATH', dirname(__FILE__));
+define('LOG_PATH', BASE_PATH . '/logs/');
 
 // CORS Settings
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key');
-header('Content-Type: application/json');
+header('Content-Type: application/json; charset=utf-8');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
 
-// Database Connection
+// Handle preflight requests
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
+
+// Create logs directory if not exists
+if (!is_dir(LOG_PATH)) {
+    mkdir(LOG_PATH, 0755, true);
+}
+
+// ============================================
+// Database Connection Class (Singleton)
+// ============================================
 class Database {
     private $conn;
+    private static $instance = null;
+    
+    private function __construct() {}
+    
+    public static function getInstance() {
+        if (self::$instance === null) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
     
     public function getConnection() {
-        $this->conn = null;
-        try {
-            $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
-            $this->conn = new PDO($dsn, DB_USER, DB_PASS);
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            http_response_code(500);
-            echo json_encode(['success' => false, 'message' => 'Database connection failed: ' . $e->getMessage()]);
-            exit;
+        if ($this->conn === null) {
+            try {
+                $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
+                $options = [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES => false,
+                    PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4"
+                ];
+                $this->conn = new PDO($dsn, DB_USER, DB_PASS, $options);
+            } catch(PDOException $e) {
+                Response::error('Database connection failed', 500);
+            }
         }
         return $this->conn;
+    }
+    
+    private function __clone() {}
+}
+
+// ============================================
+// Response Helper Class
+// ============================================
+class Response {
+    public static function success($data = null, $message = 'Success', $code = 200) {
+        http_response_code($code);
+        echo json_encode([
+            'success' => true,
+            'message' => $message,
+            'data' => $data,
+            'timestamp' => date('Y-m-d\\TH:i:s\\Z'),
+            'version' => API_VERSION
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    
+    public static function error($message = 'Error', $code = 400, $data = null) {
+        http_response_code($code);
+        echo json_encode([
+            'success' => false,
+            'message' => $message,
+            'data' => $data,
+            'timestamp' => date('Y-m-d\\TH:i:s\\Z'),
+            'version' => API_VERSION
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+}
+
+// ============================================
+// Logger Class
+// ============================================
+class Logger {
+    private $db;
+    
+    public function __construct() {
+        $this->db = Database::getInstance()->getConnection();
+    }
+    
+    public function log($action, $status, $details = '', $apiKey = null, $licenseKey = null, $userId = null) {
+        try {
+            $stmt = $this->db->prepare(
+                "INSERT INTO activity_logs (action, api_key, license_key, user_id, ip_address, user_agent, status, details) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            );
+            $stmt->execute([
+                $action, $apiKey, $licenseKey, $userId,
+                $this->getIP(),
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown',
+                $status, $details
+            ]);
+        } catch (Exception $e) {
+            error_log('Logging failed: ' . $e->getMessage());
+        }
+    }
+    
+    public function getIP() {
+        $ipKeys = ['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR'];
+        foreach ($ipKeys as $key) {
+            if (!empty($_SERVER[$key])) {
+                return trim(explode(',', $_SERVER[$key])[0]);
+            }
+        }
+        return '0.0.0.0';
+    }
+}
+
+// ============================================
+// Auth Helper (JWT)
+// ============================================
+class Auth {
+    public static function generateToken($userId) {
+        $header = base64_encode(json_encode(['alg' => 'HS256', 'typ' => 'JWT']));
+        $payload = base64_encode(json_encode([
+            'user_id' => $userId,
+            'exp' => time() + TOKEN_EXPIRY,
+            'iat' => time()
+        ]));
+        $signature = hash_hmac('sha256', "$header.$payload", SECRET_KEY);
+        return "$header.$payload.$signature";
+    }
+    
+    public static function verifyToken($token) {
+        $parts = explode('.', $token);
+        if (count($parts) !== 3) return false;
+        
+        list($header, $payload, $signature) = $parts;
+        $expectedSig = hash_hmac('sha256', "$header.$payload", SECRET_KEY);
+        
+        if (!hash_equals($expectedSig, $signature)) return false;
+        
+        $data = json_decode(base64_decode($payload), true);
+        if (!$data || $data['exp'] < time()) return false;
+        
+        return $data;
+    }
+    
+    public static function getBearerToken() {
+        $headers = getallheaders();
+        $auth = $headers['Authorization'] ?? $headers['authorization'] ?? '';
+        if (preg_match('/Bearer\\s+(.*)$/i', $auth, $matches)) {
+            return $matches[1];
+        }
+        return null;
+    }
+    
+    public static function requireAuth() {
+        $token = self::getBearerToken();
+        if (!$token) Response::error('Authorization token required', 401);
+        
+        $data = self::verifyToken($token);
+        if (!$data) Response::error('Invalid or expired token', 401);
+        
+        return $data;
+    }
+    
+    public static function requireAdmin() {
+        $data = self::requireAuth();
+        $db = Database::getInstance()->getConnection();
+        $stmt = $db->prepare("SELECT * FROM users WHERE id = ? AND role = 'admin' AND status = 'active'");
+        $stmt->execute([$data['user_id']]);
+        $user = $stmt->fetch();
+        if (!$user) Response::error('Admin access required', 403);
+        return $user;
+    }
+}
+
+// ============================================
+// Input Validation
+// ============================================
+class Validator {
+    public static function sanitize($input) {
+        if (is_string($input)) {
+            return htmlspecialchars(strip_tags(trim($input)), ENT_QUOTES, 'UTF-8');
+        }
+        return $input;
+    }
+    
+    public static function getInput() {
+        $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+        if (strpos($contentType, 'application/json') !== false) {
+            return json_decode(file_get_contents('php://input'), true) ?? [];
+        }
+        return $_POST;
+    }
+    
+    public static function required($data, $fields) {
+        foreach ($fields as $field) {
+            if (empty($data[$field])) {
+                Response::error("Field '$field' is required", 400);
+            }
+        }
     }
 }
 ?>`
   },
   {
-    id: 'database',
-    name: 'database.sql',
-    icon: <Database size={16} />,
-    description: 'MySQL Database Schema',
-    code: `-- ============================================
--- API Verification System - Database Schema
--- ============================================
-
-CREATE DATABASE IF NOT EXISTS api_verification 
-CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-USE api_verification;
-
--- Users Table
-CREATE TABLE users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(100) NOT NULL,
-    email VARCHAR(150) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL,
-    role ENUM('admin', 'developer', 'user') DEFAULT 'user',
-    status ENUM('active', 'inactive') DEFAULT 'active',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    last_login TIMESTAMP NULL
-) ENGINE=InnoDB;
-
--- API Keys Table
-CREATE TABLE api_keys (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    user_id INT NOT NULL,
-    api_key VARCHAR(255) UNIQUE NOT NULL,
-    name VARCHAR(100) NOT NULL,
-    status ENUM('active', 'inactive', 'expired') DEFAULT 'active',
-    request_count INT DEFAULT 0,
-    request_limit INT DEFAULT 100000,
-    rate_limit INT DEFAULT 1000,
-    allowed_ips TEXT NULL,
-    permissions JSON DEFAULT NULL,
-    expires_at DATE NOT NULL,
-    last_used_at TIMESTAMP NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    INDEX idx_api_key (api_key),
-    INDEX idx_status (status),
-    INDEX idx_user (user_id)
-) ENGINE=InnoDB;
-
--- Licenses Table
-CREATE TABLE licenses (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    license_key VARCHAR(100) UNIQUE NOT NULL,
-    product_name VARCHAR(150) NOT NULL,
-    license_type ENUM('monthly', 'yearly', 'lifetime') NOT NULL,
-    status ENUM('active', 'expired', 'suspended') DEFAULT 'active',
-    user_id INT NOT NULL,
-    max_devices INT DEFAULT 5,
-    active_devices INT DEFAULT 0,
-    expires_at DATE NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    INDEX idx_license_key (license_key),
-    INDEX idx_status (status)
-) ENGINE=InnoDB;
-
--- License Devices Table
-CREATE TABLE license_devices (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    license_id INT NOT NULL,
-    device_id VARCHAR(255) NOT NULL,
-    device_name VARCHAR(150),
-    ip_address VARCHAR(45),
-    activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (license_id) REFERENCES licenses(id) ON DELETE CASCADE,
-    UNIQUE KEY unique_device (license_id, device_id)
-) ENGINE=InnoDB;
-
--- Activity Logs Table
-CREATE TABLE activity_logs (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    action VARCHAR(100) NOT NULL,
-    api_key VARCHAR(255) NULL,
-    ip_address VARCHAR(45) NOT NULL,
-    user_agent TEXT NULL,
-    status ENUM('success', 'failed', 'warning') NOT NULL,
-    details TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_action (action),
-    INDEX idx_status (status),
-    INDEX idx_created (created_at)
-) ENGINE=InnoDB;
-
--- Rate Limiting Table
-CREATE TABLE rate_limits (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    api_key VARCHAR(255) NOT NULL,
-    request_count INT DEFAULT 1,
-    window_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_api_key (api_key),
-    INDEX idx_window (window_start)
-) ENGINE=InnoDB;
-
--- Blocked IPs Table
-CREATE TABLE blocked_ips (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    ip_address VARCHAR(45) NOT NULL UNIQUE,
-    reason TEXT,
-    blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    blocked_by INT NULL,
-    FOREIGN KEY (blocked_by) REFERENCES users(id) ON DELETE SET NULL
-) ENGINE=InnoDB;
-
--- Insert Default Admin User
--- Password: admin123 (hashed with password_hash)
-INSERT INTO users (name, email, password, role) VALUES 
-('Admin', 'admin@example.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2u dBmFzGyS', 'admin');`
-  },
-  {
     id: 'verify',
     name: 'api/verify.php',
+    path: 'api/verify.php',
     icon: <Shield size={16} />,
     description: 'API Key Verification Endpoint',
     code: `<?php
 // ============================================
 // API Key Verification Endpoint
-// POST /api/verify.php
+// File: api/verify.php
+// Method: POST, GET
 // ============================================
 
-require_once '../config.php';
+require_once __DIR__ . '/../config.php';
 
 class APIVerifier {
     private $db;
-    private $response;
+    private $logger;
+    private $startTime;
     
     public function __construct() {
-        $database = new Database();
-        $this->db = $database->getConnection();
-        $this->response = ['success' => false, 'message' => '', 'data' => null];
+        $this->db = Database::getInstance()->getConnection();
+        $this->logger = new Logger();
+        $this->startTime = microtime(true);
     }
     
-    // Main verification method
-    public function verify($apiKey, $ipAddress = null) {
+    public function verify($apiKey, $ip = null) {
+        $ip = $ip ?? $this->logger->getIP();
+        
         try {
-            // Step 1: Check if IP is blocked
-            if ($this->isIPBlocked($ipAddress)) {
-                $this->response['message'] = 'Access denied: IP address is blocked';
-                $this->logActivity('IP Blocked', $apiKey, $ipAddress, 'failed');
-                return $this->sendResponse(403);
+            // Check if IP is blocked
+            if ($this->isIPBlocked($ip)) {
+                $this->logger->log('IP Blocked', 'failed', 'Access denied', $apiKey);
+                Response::error('Access denied: IP is blocked', 403);
             }
             
-            // Step 2: Validate API Key exists
+            // Get API key
             $key = $this->getApiKey($apiKey);
             if (!$key) {
-                $this->response['message'] = 'Invalid API key';
-                $this->logActivity('Invalid Key', $apiKey, $ipAddress, 'failed');
-                return $this->sendResponse(401);
+                $this->logger->log('Key Not Found', 'failed', 'Invalid key', $apiKey);
+                Response::error('Invalid API key', 401);
             }
             
-            // Step 3: Check key status
+            // Check status
             if ($key['status'] !== 'active') {
-                $this->response['message'] = 'API key is ' . $key['status'];
-                $this->logActivity('Inactive Key', $apiKey, $ipAddress, 'failed');
-                return $this->sendResponse(403);
+                $this->logger->log('Key Inactive', 'failed', "Status: {$key['status']}", $apiKey);
+                Response::error("API key is {$key['status']}", 403);
             }
             
-            // Step 4: Check expiration
+            // Check expiration
             if (strtotime($key['expires_at']) < time()) {
                 $this->updateKeyStatus($key['id'], 'expired');
-                $this->response['message'] = 'API key has expired';
-                $this->logActivity('Expired Key', $apiKey, $ipAddress, 'failed');
-                return $this->sendResponse(403);
+                $this->logger->log('Key Expired', 'failed', 'Expired', $apiKey);
+                Response::error('API key expired on ' . $key['expires_at'], 403);
             }
             
-            // Step 5: Check rate limit
+            // Check rate limit
             if ($this->isRateLimited($apiKey, $key['rate_limit'])) {
-                $this->response['message'] = 'Rate limit exceeded';
-                $this->logActivity('Rate Limited', $apiKey, $ipAddress, 'warning');
-                return $this->sendResponse(429);
+                $this->logger->log('Rate Limited', 'warning', 'Limit exceeded', $apiKey);
+                Response::error('Rate limit exceeded', 429, ['retry_after' => 60]);
             }
             
-            // Step 6: Check request limit
+            // Check request limit
             if ($key['request_count'] >= $key['request_limit']) {
-                $this->response['message'] = 'Request limit exceeded';
-                $this->logActivity('Request Limit', $apiKey, $ipAddress, 'warning');
-                return $this->sendResponse(429);
+                $this->logger->log('Request Limit', 'warning', 'Limit reached', $apiKey);
+                Response::error('Request limit exceeded', 429);
             }
             
-            // Step 7: Check allowed IPs (if set)
-            if ($key['allowed_ips'] && !$this->isIPAllowed($ipAddress, $key['allowed_ips'])) {
-                $this->response['message'] = 'IP address not allowed';
-                $this->logActivity('IP Not Allowed', $apiKey, $ipAddress, 'failed');
-                return $this->sendResponse(403);
+            // Check allowed IPs
+            if (!empty($key['allowed_ips']) && !$this->isIPAllowed($ip, $key['allowed_ips'])) {
+                $this->logger->log('IP Not Allowed', 'failed', "IP: $ip", $apiKey);
+                Response::error('IP not authorized', 403);
             }
             
-            // Step 8: All checks passed - Update usage
+            // All checks passed
             $this->updateKeyUsage($key['id']);
-            $this->incrementRateLimit($apiKey);
+            $this->incrementRateLimit($apiKey, $ip);
             
-            // Success response
-            $this->response = [
-                'success' => true,
-                'message' => 'API key is valid',
-                'data' => [
-                    'key_name' => $key['name'],
-                    'permissions' => json_decode($key['permissions'] ?? '[]'),
-                    'requests_remaining' => $key['request_limit'] - $key['request_count'] - 1,
-                    'expires_at' => $key['expires_at'],
-                    'rate_limit' => $key['rate_limit'],
-                    'verified_at' => date('Y-m-d H:i:s')
-                ]
-            ];
+            $responseTime = round((microtime(true) - $this->startTime) * 1000, 2);
             
-            $this->logActivity('Verified', $apiKey, $ipAddress, 'success');
-            return $this->sendResponse(200);
+            $this->logger->log('Verified', 'success', 'Key valid', $apiKey);
+            
+            Response::success([
+                'key_name' => $key['name'],
+                'status' => $key['status'],
+                'permissions' => json_decode($key['permissions'] ?? '["read"]'),
+                'requests_used' => $key['request_count'] + 1,
+                'requests_limit' => $key['request_limit'],
+                'requests_remaining' => $key['request_limit'] - $key['request_count'] - 1,
+                'rate_limit' => $key['rate_limit'] . ' req/min',
+                'expires_at' => $key['expires_at'],
+                'verified_at' => date('Y-m-d H:i:s'),
+                'response_time' => $responseTime . 'ms',
+                'ip' => $ip
+            ], 'API key is valid');
             
         } catch (Exception $e) {
-            $this->response['message'] = 'Server error: ' . $e->getMessage();
-            return $this->sendResponse(500);
+            $this->logger->log('Error', 'error', $e->getMessage(), $apiKey);
+            Response::error('Server error', 500);
         }
     }
     
-    // Get API key from database
+    public function getStats($apiKey) {
+        $key = $this->getApiKey($apiKey);
+        if (!$key) Response::error('Invalid API key', 401);
+        
+        $stmt = $this->db->prepare(
+            "SELECT COUNT(*) as total, 
+                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success,
+                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed
+             FROM activity_logs WHERE api_key = ? AND DATE(created_at) = CURDATE()"
+        );
+        $stmt->execute([$apiKey]);
+        $today = $stmt->fetch();
+        
+        Response::success([
+            'key_name' => $key['name'],
+            'total_requests' => $key['request_count'],
+            'request_limit' => $key['request_limit'],
+            'usage_percentage' => round(($key['request_count'] / $key['request_limit']) * 100, 2),
+            'today' => $today
+        ]);
+    }
+    
     private function getApiKey($apiKey) {
         $stmt = $this->db->prepare("SELECT * FROM api_keys WHERE api_key = ?");
         $stmt->execute([$apiKey]);
         return $stmt->fetch();
     }
     
-    // Check if IP is blocked
     private function isIPBlocked($ip) {
-        if (!$ip) return false;
         $stmt = $this->db->prepare("SELECT COUNT(*) FROM blocked_ips WHERE ip_address = ?");
         $stmt->execute([$ip]);
         return $stmt->fetchColumn() > 0;
     }
     
-    // Check rate limiting
     private function isRateLimited($apiKey, $limit) {
-        $stmt = $this->db->prepare(
-            "SELECT request_count FROM rate_limits 
-             WHERE api_key = ? AND window_start > DATE_SUB(NOW(), INTERVAL 1 MINUTE)"
-        );
+        $this->db->prepare("DELETE FROM rate_limits WHERE window_start < DATE_SUB(NOW(), INTERVAL 1 MINUTE)")->execute();
+        $stmt = $this->db->prepare("SELECT COALESCE(SUM(request_count),0) FROM rate_limits WHERE api_key = ? AND window_start > DATE_SUB(NOW(), INTERVAL 1 MINUTE)");
         $stmt->execute([$apiKey]);
-        $result = $stmt->fetch();
-        return $result && $result['request_count'] >= $limit;
+        return $stmt->fetchColumn() >= $limit;
     }
     
-    // Check if IP is in allowed list
     private function isIPAllowed($ip, $allowedIPs) {
-        if (!$ip || !$allowedIPs) return true;
-        $ips = explode(',', $allowedIPs);
-        return in_array($ip, array_map('trim', $ips));
+        return in_array($ip, array_map('trim', explode(',', $allowedIPs)));
     }
     
-    // Update key usage count
     private function updateKeyUsage($keyId) {
-        $stmt = $this->db->prepare(
-            "UPDATE api_keys SET request_count = request_count + 1, last_used_at = NOW() WHERE id = ?"
-        );
+        $stmt = $this->db->prepare("UPDATE api_keys SET request_count = request_count + 1, last_used_at = NOW() WHERE id = ?");
         $stmt->execute([$keyId]);
     }
     
-    // Update key status
     private function updateKeyStatus($keyId, $status) {
         $stmt = $this->db->prepare("UPDATE api_keys SET status = ? WHERE id = ?");
         $stmt->execute([$status, $keyId]);
     }
     
-    // Increment rate limit counter
-    private function incrementRateLimit($apiKey) {
-        $stmt = $this->db->prepare(
-            "INSERT INTO rate_limits (api_key, request_count, window_start) 
-             VALUES (?, 1, NOW()) 
-             ON DUPLICATE KEY UPDATE request_count = request_count + 1"
-        );
-        $stmt->execute([$apiKey]);
-    }
-    
-    // Log activity
-    private function logActivity($action, $apiKey, $ip, $status) {
-        $stmt = $this->db->prepare(
-            "INSERT INTO activity_logs (action, api_key, ip_address, user_agent, status, details) 
-             VALUES (?, ?, ?, ?, ?, ?)"
-        );
-        $stmt->execute([
-            $action,
-            $apiKey,
-            $ip ?? 'unknown',
-            $_SERVER['HTTP_USER_AGENT'] ?? 'unknown',
-            $status,
-            $this->response['message']
-        ]);
-    }
-    
-    // Send JSON response
-    private function sendResponse($httpCode) {
-        http_response_code($httpCode);
-        echo json_encode($this->response, JSON_PRETTY_PRINT);
-        exit;
+    private function incrementRateLimit($apiKey, $ip) {
+        $stmt = $this->db->prepare("INSERT INTO rate_limits (api_key, ip_address, request_count, window_start) VALUES (?, ?, 1, NOW()) ON DUPLICATE KEY UPDATE request_count = request_count + 1");
+        $stmt->execute([$apiKey, $ip]);
     }
 }
 
 // Handle Request
 $method = $_SERVER['REQUEST_METHOD'];
+$input = Validator::getInput();
+$verifier = new APIVerifier();
 
 if ($method === 'POST' || $method === 'GET') {
-    $input = json_decode(file_get_contents('php://input'), true);
-    
+    $action = $input['action'] ?? $_GET['action'] ?? 'verify';
     $apiKey = $input['api_key'] ?? $_GET['api_key'] ?? $_SERVER['HTTP_X_API_KEY'] ?? null;
-    $ipAddress = $input['ip'] ?? $_SERVER['REMOTE_ADDR'] ?? null;
+    $ip = $input['ip'] ?? $_GET['ip'] ?? null;
     
-    if (!$apiKey) {
-        http_response_code(400);
-        echo json_encode(['success' => false, 'message' => 'API key is required']);
-        exit;
-    }
+    if (!$apiKey) Response::error('API key required', 400);
     
-    $verifier = new APIVerifier();
-    $verifier->verify($apiKey, $ipAddress);
+    match($action) {
+        'verify' => $verifier->verify($apiKey, $ip),
+        'stats' => $verifier->getStats($apiKey),
+        default => Response::error("Unknown action: $action", 400)
+    };
 } else {
-    http_response_code(405);
-    echo json_encode(['success' => false, 'message' => 'Method not allowed']);
+    Response::error('Method not allowed', 405);
 }
 ?>`
   },
   {
     id: 'license',
     name: 'api/license.php',
+    path: 'api/license.php',
     icon: <FileCode size={16} />,
-    description: 'License Verification Endpoint',
+    description: 'License Verification & Device Management',
     code: `<?php
 // ============================================
 // License Verification Endpoint
-// POST /api/license.php
+// File: api/license.php
+// Method: POST
+// Actions: verify, activate, deactivate, check
 // ============================================
 
-require_once '../config.php';
+require_once __DIR__ . '/../config.php';
 
-class LicenseVerifier {
+class LicenseManager {
     private $db;
+    private $logger;
     
     public function __construct() {
-        $database = new Database();
-        $this->db = $database->getConnection();
+        $this->db = Database::getInstance()->getConnection();
+        $this->logger = new Logger();
     }
     
-    // Verify License
-    public function verifyLicense($licenseKey, $deviceId = null) {
-        $response = ['success' => false, 'message' => '', 'data' => null];
-        
-        try {
-            // Get license
-            $stmt = $this->db->prepare("SELECT * FROM licenses WHERE license_key = ?");
-            $stmt->execute([$licenseKey]);
-            $license = $stmt->fetch();
-            
-            if (!$license) {
-                $response['message'] = 'Invalid license key';
-                return $this->send($response, 401);
-            }
-            
-            // Check status
-            if ($license['status'] !== 'active') {
-                $response['message'] = 'License is ' . $license['status'];
-                return $this->send($response, 403);
-            }
-            
-            // Check expiration
-            if ($license['license_type'] !== 'lifetime' && strtotime($license['expires_at']) < time()) {
-                $this->updateStatus($license['id'], 'expired');
-                $response['message'] = 'License has expired on ' . $license['expires_at'];
-                return $this->send($response, 403);
-            }
-            
-            // Device verification
-            if ($deviceId) {
-                $deviceCheck = $this->checkDevice($license['id'], $deviceId);
-                
-                if (!$deviceCheck) {
-                    // New device - check limit
-                    if ($license['active_devices'] >= $license['max_devices']) {
-                        $response['message'] = 'Maximum devices reached (' . $license['max_devices'] . ')';
-                        return $this->send($response, 403);
-                    }
-                    // Register new device
-                    $this->registerDevice($license['id'], $deviceId);
-                }
-            }
-            
-            $response = [
-                'success' => true,
-                'message' => 'License is valid',
-                'data' => [
-                    'product' => $license['product_name'],
-                    'type' => $license['license_type'],
-                    'expires_at' => $license['expires_at'],
-                    'max_devices' => $license['max_devices'],
-                    'active_devices' => $license['active_devices'] + ($deviceId && !$deviceCheck ? 1 : 0),
-                    'verified_at' => date('Y-m-d H:i:s')
-                ]
-            ];
-            
-            return $this->send($response, 200);
-            
-        } catch (Exception $e) {
-            $response['message'] = 'Server error: ' . $e->getMessage();
-            return $this->send($response, 500);
-        }
-    }
-    
-    // Activate License
-    public function activateLicense($licenseKey, $deviceId, $deviceName = null) {
-        $response = ['success' => false, 'message' => ''];
-        
-        $stmt = $this->db->prepare("SELECT * FROM licenses WHERE license_key = ?");
-        $stmt->execute([$licenseKey]);
-        $license = $stmt->fetch();
-        
+    public function verify($licenseKey, $deviceId = null, $deviceName = null) {
+        $license = $this->getLicense($licenseKey);
         if (!$license) {
-            $response['message'] = 'Invalid license key';
-            return $this->send($response, 401);
+            $this->logger->log('License Not Found', 'failed', 'Invalid key', null, $licenseKey);
+            Response::error('Invalid license key', 401);
         }
         
         if ($license['status'] !== 'active') {
-            $response['message'] = 'License is not active';
-            return $this->send($response, 403);
+            Response::error("License is {$license['status']}", 403);
         }
         
+        // Check expiration
+        if ($license['license_type'] !== 'lifetime' && strtotime($license['expires_at']) < time()) {
+            $this->updateStatus($license['id'], 'expired');
+            Response::error('License expired on ' . $license['expires_at'], 403);
+        }
+        
+        // Device handling
+        $deviceInfo = null;
+        if ($deviceId) {
+            $existing = $this->getDevice($license['id'], $deviceId);
+            if ($existing) {
+                $this->updateDeviceActive($existing['id']);
+                $deviceInfo = ['device_id' => $deviceId, 'status' => 'registered'];
+            } else {
+                if ($license['active_devices'] >= $license['max_devices']) {
+                    Response::error('Max devices reached (' . $license['max_devices'] . ')', 403);
+                }
+                $this->registerDevice($license['id'], $deviceId, $deviceName);
+                $deviceInfo = ['device_id' => $deviceId, 'status' => 'new'];
+            }
+        }
+        
+        $devices = $this->getDevices($license['id']);
+        $this->logger->log('License Verified', 'success', 'Valid', null, $licenseKey);
+        
+        Response::success([
+            'license_key' => $licenseKey,
+            'product' => $license['product_name'],
+            'type' => $license['license_type'],
+            'status' => $license['status'],
+            'expires_at' => $license['license_type'] === 'lifetime' ? 'Never' : $license['expires_at'],
+            'max_devices' => $license['max_devices'],
+            'active_devices' => $license['active_devices'],
+            'devices' => $devices,
+            'device' => $deviceInfo,
+            'verified_at' => date('Y-m-d H:i:s')
+        ], 'License is valid');
+    }
+    
+    public function activate($licenseKey, $deviceId, $deviceName = null) {
+        $license = $this->getLicense($licenseKey);
+        if (!$license) Response::error('Invalid license key', 401);
+        if ($license['status'] !== 'active') Response::error('License not active', 403);
+        
+        $existing = $this->getDevice($license['id'], $deviceId);
+        if ($existing) Response::success(['already_registered' => true], 'Device already registered');
+        
         if ($license['active_devices'] >= $license['max_devices']) {
-            $response['message'] = 'Maximum devices limit reached';
-            return $this->send($response, 403);
+            Response::error('Max device limit reached', 403);
         }
         
         $this->registerDevice($license['id'], $deviceId, $deviceName);
+        $this->logger->log('Device Activated', 'success', "Device: $deviceId", null, $licenseKey);
         
-        $response = [
-            'success' => true,
-            'message' => 'License activated successfully',
-            'data' => [
-                'product' => $license['product_name'],
-                'expires_at' => $license['expires_at']
-            ]
-        ];
-        
-        return $this->send($response, 200);
+        Response::success([
+            'license_key' => $licenseKey,
+            'device_id' => $deviceId,
+            'activated_at' => date('Y-m-d H:i:s')
+        ], 'License activated');
     }
     
-    // Deactivate License
-    public function deactivateLicense($licenseKey, $deviceId) {
-        $response = ['success' => false, 'message' => ''];
+    public function deactivate($licenseKey, $deviceId) {
+        $license = $this->getLicense($licenseKey);
+        if (!$license) Response::error('Invalid license key', 401);
         
-        $stmt = $this->db->prepare("SELECT id FROM licenses WHERE license_key = ?");
-        $stmt->execute([$licenseKey]);
-        $license = $stmt->fetch();
+        $device = $this->getDevice($license['id'], $deviceId);
+        if (!$device) Response::error('Device not found', 404);
         
-        if (!$license) {
-            $response['message'] = 'Invalid license key';
-            return $this->send($response, 401);
-        }
-        
-        $stmt = $this->db->prepare("DELETE FROM license_devices WHERE license_id = ? AND device_id = ?");
-        $stmt->execute([$license['id'], $deviceId]);
-        
-        // Update device count
-        $stmt = $this->db->prepare("UPDATE licenses SET active_devices = active_devices - 1 WHERE id = ?");
+        $this->removeDevice($device['id']);
+        $stmt = $this->db->prepare("UPDATE licenses SET active_devices = GREATEST(0, active_devices - 1) WHERE id = ?");
         $stmt->execute([$license['id']]);
         
-        $response = ['success' => true, 'message' => 'License deactivated successfully'];
-        return $this->send($response, 200);
+        $this->logger->log('Device Deactivated', 'success', "Device: $deviceId", null, $licenseKey);
+        Response::success(null, 'Device deactivated');
     }
     
-    private function checkDevice($licenseId, $deviceId) {
-        $stmt = $this->db->prepare("SELECT id FROM license_devices WHERE license_id = ? AND device_id = ?");
-        $stmt->execute([$licenseId, $deviceId]);
-        $device = $stmt->fetch();
+    public function checkStatus($licenseKey) {
+        $license = $this->getLicense($licenseKey);
+        if (!$license) Response::error('Invalid license key', 401);
         
-        if ($device) {
-            // Update last active
-            $stmt = $this->db->prepare("UPDATE license_devices SET last_active = NOW() WHERE id = ?");
-            $stmt->execute([$device['id']]);
-            return true;
-        }
-        return false;
+        Response::success([
+            'license_key' => $licenseKey,
+            'product' => $license['product_name'],
+            'type' => $license['license_type'],
+            'status' => $license['status'],
+            'expires_at' => $license['expires_at'],
+            'max_devices' => $license['max_devices'],
+            'active_devices' => $license['active_devices'],
+            'devices' => $this->getDevices($license['id']),
+            'days_remaining' => $license['license_type'] === 'lifetime' ? -1 : max(0, (strtotime($license['expires_at']) - time()) / 86400)
+        ]);
+    }
+    
+    private function getLicense($key) {
+        $stmt = $this->db->prepare("SELECT * FROM licenses WHERE license_key = ?");
+        $stmt->execute([$key]);
+        return $stmt->fetch();
+    }
+    
+    private function getDevice($licenseId, $deviceId) {
+        $stmt = $this->db->prepare("SELECT * FROM license_devices WHERE license_id = ? AND device_id = ?");
+        $stmt->execute([$licenseId, $deviceId]);
+        return $stmt->fetch();
+    }
+    
+    private function getDevices($licenseId) {
+        $stmt = $this->db->prepare("SELECT * FROM license_devices WHERE license_id = ? ORDER BY activated_at DESC");
+        $stmt->execute([$licenseId]);
+        return $stmt->fetchAll();
     }
     
     private function registerDevice($licenseId, $deviceId, $deviceName = null) {
-        $stmt = $this->db->prepare(
-            "INSERT INTO license_devices (license_id, device_id, device_name, ip_address) 
-             VALUES (?, ?, ?, ?)"
-        );
-        $stmt->execute([$licenseId, $deviceId, $deviceName, $_SERVER['REMOTE_ADDR'] ?? '']);
-        
+        $stmt = $this->db->prepare("INSERT INTO license_devices (license_id, device_id, device_name, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)");
+        $stmt->execute([$licenseId, $deviceId, $deviceName, $this->logger->getIP(), $_SERVER['HTTP_USER_AGENT'] ?? '']);
         $stmt = $this->db->prepare("UPDATE licenses SET active_devices = active_devices + 1 WHERE id = ?");
         $stmt->execute([$licenseId]);
+    }
+    
+    private function updateDeviceActive($id) {
+        $stmt = $this->db->prepare("UPDATE license_devices SET last_active = NOW() WHERE id = ?");
+        $stmt->execute([$id]);
+    }
+    
+    private function removeDevice($id) {
+        $stmt = $this->db->prepare("DELETE FROM license_devices WHERE id = ?");
+        $stmt->execute([$id]);
     }
     
     private function updateStatus($id, $status) {
         $stmt = $this->db->prepare("UPDATE licenses SET status = ? WHERE id = ?");
         $stmt->execute([$status, $id]);
     }
-    
-    private function send($response, $code) {
-        http_response_code($code);
-        echo json_encode($response, JSON_PRETTY_PRINT);
-        exit;
-    }
 }
 
 // Handle Request
 $method = $_SERVER['REQUEST_METHOD'];
-$input = json_decode(file_get_contents('php://input'), true);
-$verifier = new LicenseVerifier();
+if ($method !== 'POST') Response::error('Use POST', 405);
 
-switch ($method) {
-    case 'POST':
-        $action = $input['action'] ?? 'verify';
-        switch ($action) {
-            case 'verify':
-                $verifier->verifyLicense($input['license_key'], $input['device_id'] ?? null);
-                break;
-            case 'activate':
-                $verifier->activateLicense($input['license_key'], $input['device_id'], $input['device_name'] ?? null);
-                break;
-            case 'deactivate':
-                $verifier->deactivateLicense($input['license_key'], $input['device_id']);
-                break;
-            default:
-                http_response_code(400);
-                echo json_encode(['success' => false, 'message' => 'Invalid action']);
-        }
-        break;
-    default:
-        http_response_code(405);
-        echo json_encode(['success' => false, 'message' => 'Method not allowed']);
-}
+$input = Validator::getInput();
+$action = $input['action'] ?? 'verify';
+$manager = new LicenseManager();
+
+match($action) {
+    'verify' => $manager->verify($input['license_key'] ?? null, $input['device_id'] ?? null, $input['device_name'] ?? null),
+    'activate' => $manager->activate($input['license_key'] ?? null, $input['device_id'] ?? null, $input['device_name'] ?? null),
+    'deactivate' => $manager->deactivate($input['license_key'] ?? null, $input['device_id'] ?? null),
+    'check' => $manager->checkStatus($input['license_key'] ?? null),
+    default => Response::error("Unknown action: $action", 400)
+};
 ?>`
   },
   {
     id: 'admin',
     name: 'api/admin.php',
+    path: 'api/admin.php',
     icon: <Server size={16} />,
-    description: 'Admin API - Key & License Management',
+    description: 'Admin API - Full Management System',
     code: `<?php
 // ============================================
-// Admin API - Key & License Management
-// Requires Authentication (Bearer Token)
+// Admin API - Complete Management System
+// File: api/admin.php
+// Requires: Bearer Token (Admin)
 // ============================================
 
-require_once '../config.php';
+require_once __DIR__ . '/../config.php';
 
 class AdminAPI {
     private $db;
+    private $logger;
+    private $admin;
     
     public function __construct() {
-        $database = new Database();
-        $this->db = $database->getConnection();
-        $this->authenticate();
+        $this->db = Database::getInstance()->getConnection();
+        $this->logger = new Logger();
+        $this->admin = Auth::requireAdmin();
     }
     
-    // Authentication check
-    private function authenticate() {
-        $headers = getallheaders();
-        $auth = $headers['Authorization'] ?? '';
-        
-        if (empty($auth) || !str_starts_with($auth, 'Bearer ')) {
-            $this->send(['success' => false, 'message' => 'Unauthorized'], 401);
-        }
-        
-        $token = substr($auth, 7);
-        // Verify JWT or session token here
-        // For simplicity, checking against a stored token
-        $stmt = $this->db->prepare("SELECT * FROM users WHERE role = 'admin' AND status = 'active'");
-        $stmt->execute();
-        $admin = $stmt->fetch();
-        
-        if (!$admin) {
-            $this->send(['success' => false, 'message' => 'Admin access required'], 403);
-        }
-    }
+    // === API KEY MANAGEMENT ===
     
-    // Generate new API key
     public function generateKey($data) {
-        $apiKey = 'ak_live_' . bin2hex(random_bytes(10));
+        Validator::required($data, ['user_id', 'name']);
+        $prefix = ($data['type'] ?? 'live') === 'test' ? 'ak_test_' : 'ak_live_';
+        $apiKey = $prefix . bin2hex(random_bytes(10));
         
-        $stmt = $this->db->prepare(
-            "INSERT INTO api_keys (user_id, api_key, name, request_limit, rate_limit, expires_at, permissions) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
-        );
-        $stmt->execute([
-            $data['user_id'],
-            $apiKey,
-            $data['name'],
-            $data['request_limit'] ?? 100000,
-            $data['rate_limit'] ?? 1000,
-            $data['expires_at'],
-            json_encode($data['permissions'] ?? ['read'])
-        ]);
+        $stmt = $this->db->prepare("INSERT INTO api_keys (user_id, api_key, name, request_limit, rate_limit, permissions, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        $stmt->execute([$data['user_id'], $apiKey, $data['name'], $data['request_limit'] ?? 100000, $data['rate_limit'] ?? 1000, json_encode($data['permissions'] ?? ['read']), $data['expires_at'] ?? date('Y-m-d', strtotime('+1 year'))]);
         
-        $this->send([
-            'success' => true,
-            'message' => 'API key generated successfully',
-            'data' => ['api_key' => $apiKey, 'id' => $this->db->lastInsertId()]
-        ], 201);
+        $this->logger->log('Key Generated', 'success', $apiKey, $apiKey, null, $this->admin['id']);
+        Response::success(['api_key' => $apiKey, 'id' => $this->db->lastInsertId()], 'Key generated', 201);
     }
     
-    // Revoke API key
-    public function revokeKey($keyId) {
+    public function revokeKey($data) {
+        Validator::required($data, ['id']);
         $stmt = $this->db->prepare("UPDATE api_keys SET status = 'inactive' WHERE id = ?");
-        $stmt->execute([$keyId]);
-        
-        $this->send(['success' => true, 'message' => 'API key revoked']);
+        $stmt->execute([$data['id']]);
+        $this->logger->log('Key Revoked', 'success', "ID: {$data['id']}", null, null, $this->admin['id']);
+        Response::success(null, 'Key revoked');
     }
     
-    // Delete API key
-    public function deleteKey($keyId) {
+    public function deleteKey($data) {
+        Validator::required($data, ['id']);
         $stmt = $this->db->prepare("DELETE FROM api_keys WHERE id = ?");
-        $stmt->execute([$keyId]);
-        
-        $this->send(['success' => true, 'message' => 'API key deleted']);
+        $stmt->execute([$data['id']]);
+        Response::success(null, 'Key deleted');
     }
     
-    // Get all API keys
     public function getKeys($page = 1, $limit = 20) {
         $offset = ($page - 1) * $limit;
-        
-        $stmt = $this->db->prepare(
-            "SELECT ak.*, u.name as user_name 
-             FROM api_keys ak 
-             JOIN users u ON ak.user_id = u.id 
-             ORDER BY ak.created_at DESC 
-             LIMIT ? OFFSET ?"
-        );
+        $stmt = $this->db->prepare("SELECT ak.*, u.name as user_name FROM api_keys ak JOIN users u ON ak.user_id = u.id ORDER BY ak.created_at DESC LIMIT ? OFFSET ?");
         $stmt->execute([$limit, $offset]);
-        $keys = $stmt->fetchAll();
-        
-        $stmt = $this->db->query("SELECT COUNT(*) FROM api_keys");
-        $total = $stmt->fetchColumn();
-        
-        $this->send([
-            'success' => true,
-            'data' => $keys,
-            'pagination' => [
-                'total' => $total,
-                'page' => $page,
-                'limit' => $limit,
-                'pages' => ceil($total / $limit)
-            ]
-        ]);
+        $total = $this->db->query("SELECT COUNT(*) FROM api_keys")->fetchColumn();
+        Response::success(['keys' => $stmt->fetchAll(), 'total' => (int)$total, 'page' => $page]);
     }
     
-    // Create license
+    // === LICENSE MANAGEMENT ===
+    
     public function createLicense($data) {
-        $licenseKey = 'LIC-' . date('Y') . '-' . strtoupper(bin2hex(random_bytes(6)));
-        $licenseKey = preg_replace('/(.{4})/', '$1-', $licenseKey, 3);
+        Validator::required($data, ['user_id', 'product_name', 'license_type']);
+        $seg = fn() => strtoupper(bin2hex(random_bytes(2)));
+        $licenseKey = "LIC-" . date('Y') . "-{$seg()}-{$seg()}-{$seg()}";
         
-        $stmt = $this->db->prepare(
-            "INSERT INTO licenses (license_key, product_name, license_type, user_id, max_devices, expires_at) 
-             VALUES (?, ?, ?, ?, ?, ?)"
-        );
-        $stmt->execute([
-            $licenseKey,
-            $data['product_name'],
-            $data['license_type'],
-            $data['user_id'],
-            $data['max_devices'] ?? 5,
-            $data['expires_at']
-        ]);
+        $stmt = $this->db->prepare("INSERT INTO licenses (license_key, product_name, license_type, user_id, max_devices, expires_at) VALUES (?, ?, ?, ?, ?, ?)");
+        $stmt->execute([$licenseKey, $data['product_name'], $data['license_type'], $data['user_id'], $data['max_devices'] ?? 5, $data['expires_at'] ?? date('Y-m-d', strtotime('+1 month'))]);
         
-        $this->send([
-            'success' => true,
-            'message' => 'License created',
-            'data' => ['license_key' => $licenseKey, 'id' => $this->db->lastInsertId()]
-        ], 201);
+        $this->logger->log('License Created', 'success', $licenseKey, null, $licenseKey, $this->admin['id']);
+        Response::success(['license_key' => $licenseKey, 'id' => $this->db->lastInsertId()], 'License created', 201);
     }
     
-    // Block IP
-    public function blockIP($ip, $reason = null) {
-        $stmt = $this->db->prepare(
-            "INSERT INTO blocked_ips (ip_address, reason) VALUES (?, ?) 
-             ON DUPLICATE KEY UPDATE reason = ?"
-        );
-        $stmt->execute([$ip, $reason, $reason]);
-        
-        $this->send(['success' => true, 'message' => 'IP blocked: ' . $ip]);
+    public function getLicenses($page = 1, $limit = 20) {
+        $offset = ($page - 1) * $limit;
+        $stmt = $this->db->prepare("SELECT l.*, u.name as user_name FROM licenses l JOIN users u ON l.user_id = u.id ORDER BY l.created_at DESC LIMIT ? OFFSET ?");
+        $stmt->execute([$limit, $offset]);
+        $total = $this->db->query("SELECT COUNT(*) FROM licenses")->fetchColumn();
+        Response::success(['licenses' => $stmt->fetchAll(), 'total' => (int)$total]);
     }
     
-    // Get statistics
+    // === USER MANAGEMENT ===
+    
+    public function createUser($data) {
+        Validator::required($data, ['name', 'email', 'password']);
+        $hash = password_hash($data['password'], PASSWORD_BCRYPT, ['cost' => 12]);
+        $stmt = $this->db->prepare("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)");
+        try {
+            $stmt->execute([$data['name'], $data['email'], $hash, $data['role'] ?? 'user']);
+        } catch (PDOException $e) {
+            if ($e->getCode() == 23000) Response::error('Email already exists', 409);
+            throw $e;
+        }
+        Response::success(['id' => $this->db->lastInsertId()], 'User created', 201);
+    }
+    
+    public function getUsers($page = 1, $limit = 20) {
+        $offset = ($page - 1) * $limit;
+        $stmt = $this->db->prepare("SELECT id, name, email, role, status, created_at, last_login FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        $stmt->execute([$limit, $offset]);
+        $total = $this->db->query("SELECT COUNT(*) FROM users")->fetchColumn();
+        Response::success(['users' => $stmt->fetchAll(), 'total' => (int)$total]);
+    }
+    
+    // === SECURITY ===
+    
+    public function blockIP($data) {
+        Validator::required($data, ['ip']);
+        $stmt = $this->db->prepare("INSERT INTO blocked_ips (ip_address, reason, blocked_by) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE reason = ?");
+        $stmt->execute([$data['ip'], $data['reason'] ?? 'Blocked', $this->admin['id'], $data['reason'] ?? 'Blocked']);
+        $this->logger->log('IP Blocked', 'success', $data['ip'], null, null, $this->admin['id']);
+        Response::success(['ip' => $data['ip']], 'IP blocked');
+    }
+    
+    public function unblockIP($data) {
+        Validator::required($data, ['ip']);
+        $stmt = $this->db->prepare("DELETE FROM blocked_ips WHERE ip_address = ?");
+        $stmt->execute([$data['ip']]);
+        Response::success(['ip' => $data['ip']], 'IP unblocked');
+    }
+    
+    // === STATISTICS ===
+    
     public function getStats() {
         $stats = [];
+        $stats['active_keys'] = (int)$this->db->query("SELECT COUNT(*) FROM api_keys WHERE status='active'")->fetchColumn();
+        $stats['total_requests'] = (int)$this->db->query("SELECT COALESCE(SUM(request_count),0) FROM api_keys")->fetchColumn();
+        $stats['active_licenses'] = (int)$this->db->query("SELECT COUNT(*) FROM licenses WHERE status='active'")->fetchColumn();
+        $stats['active_users'] = (int)$this->db->query("SELECT COUNT(*) FROM users WHERE status='active'")->fetchColumn();
+        $stats['today_requests'] = (int)$this->db->query("SELECT COUNT(*) FROM activity_logs WHERE DATE(created_at)=CURDATE()")->fetchColumn();
+        $stats['blocked_ips'] = (int)$this->db->query("SELECT COUNT(*) FROM blocked_ips")->fetchColumn();
         
-        $stmt = $this->db->query("SELECT COUNT(*) FROM api_keys WHERE status = 'active'");
-        $stats['active_keys'] = $stmt->fetchColumn();
+        // Chart data
+        $stmt = $this->db->query("SELECT DATE(created_at) as date, COUNT(*) as total, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success FROM activity_logs WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) GROUP BY DATE(created_at) ORDER BY date");
+        $stats['chart'] = $stmt->fetchAll();
         
-        $stmt = $this->db->query("SELECT SUM(request_count) FROM api_keys");
-        $stats['total_requests'] = $stmt->fetchColumn() ?? 0;
-        
-        $stmt = $this->db->query("SELECT COUNT(*) FROM licenses WHERE status = 'active'");
-        $stats['active_licenses'] = $stmt->fetchColumn();
-        
-        $stmt = $this->db->query("SELECT COUNT(*) FROM users WHERE status = 'active'");
-        $stats['active_users'] = $stmt->fetchColumn();
-        
-        $stmt = $this->db->query(
-            "SELECT COUNT(*) FROM activity_logs WHERE created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
-        );
-        $stats['requests_today'] = $stmt->fetchColumn();
-        
-        $this->send(['success' => true, 'data' => $stats]);
+        Response::success($stats);
     }
     
-    private function send($response, $code = 200) {
-        http_response_code($code);
-        echo json_encode($response, JSON_PRETTY_PRINT);
-        exit;
+    public function getLogs($page = 1, $limit = 50) {
+        $offset = ($page - 1) * $limit;
+        $stmt = $this->db->prepare("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        $stmt->execute([$limit, $offset]);
+        Response::success(['logs' => $stmt->fetchAll(), 'page' => $page]);
+    }
+    
+    // === AUTH ===
+    
+    public function login($data) {
+        Validator::required($data, ['email', 'password']);
+        $stmt = $this->db->prepare("SELECT * FROM users WHERE email = ? AND role = 'admin'");
+        $stmt->execute([$data['email']]);
+        $user = $stmt->fetch();
+        
+        if (!$user || !password_verify($data['password'], $user['password'])) {
+            Response::error('Invalid credentials', 401);
+        }
+        
+        $this->db->prepare("UPDATE users SET login_attempts=0, last_login=NOW() WHERE id=?")->execute([$user['id']]);
+        $token = Auth::generateToken($user['id']);
+        
+        Response::success(['token' => $token, 'user' => ['id' => $user['id'], 'name' => $user['name'], 'role' => $user['role']]], 'Login successful');
     }
 }
 
-// Route handling
-$admin = new AdminAPI();
-$method = $_SERVER['REQUEST_METHOD'];
-$input = json_decode(file_get_contents('php://input'), true);
+// Route Handling
+$input = Validator::getInput();
 $action = $_GET['action'] ?? $input['action'] ?? '';
+$page = (int)($_GET['page'] ?? 1);
+$limit = (int)($_GET['limit'] ?? 20);
 
-switch ($action) {
-    case 'generate_key':
-        $admin->generateKey($input);
-        break;
-    case 'revoke_key':
-        $admin->revokeKey($_GET['id'] ?? $input['id']);
-        break;
-    case 'delete_key':
-        $admin->deleteKey($_GET['id'] ?? $input['id']);
-        break;
-    case 'get_keys':
-        $admin->getKeys($_GET['page'] ?? 1);
-        break;
-    case 'create_license':
-        $admin->createLicense($input);
-        break;
-    case 'block_ip':
-        $admin->blockIP($input['ip'], $input['reason'] ?? null);
-        break;
-    case 'stats':
-        $admin->getStats();
-        break;
-    default:
-        http_response_code(400);
-        echo json_encode(['success' => false, 'message' => 'Invalid action']);
+// Login (no auth required)
+if ($action === 'login') {
+    $db = Database::getInstance()->getConnection();
+    Validator::required($input, ['email', 'password']);
+    $stmt = $db->prepare("SELECT * FROM users WHERE email = ?");
+    $stmt->execute([$input['email']]);
+    $user = $stmt->fetch();
+    if (!$user || !password_verify($input['password'], $user['password'])) Response::error('Invalid credentials', 401);
+    $token = Auth::generateToken($user['id']);
+    Response::success(['token' => $token, 'user' => ['id' => $user['id'], 'name' => $user['name'], 'role' => $user['role']]]);
+    exit;
 }
+
+$admin = new AdminAPI();
+
+match($action) {
+    'generate_key' => $admin->generateKey($input),
+    'revoke_key' => $admin->revokeKey($input),
+    'delete_key' => $admin->deleteKey($input),
+    'get_keys' => $admin->getKeys($page, $limit),
+    'create_license' => $admin->createLicense($input),
+    'get_licenses' => $admin->getLicenses($page, $limit),
+    'create_user' => $admin->createUser($input),
+    'get_users' => $admin->getUsers($page, $limit),
+    'block_ip' => $admin->blockIP($input),
+    'unblock_ip' => $admin->unblockIP($input),
+    'stats' => $admin->getStats(),
+    'get_logs' => $admin->getLogs($page, $limit),
+    default => Response::error("Unknown action: $action", 400)
+};
 ?>`
   },
   {
     id: 'htaccess',
     name: '.htaccess',
+    path: '.htaccess',
     icon: <Server size={16} />,
-    description: 'Apache Configuration',
-    code: `# ============================================
-# API Verification System - Apache Config
-# ============================================
-
-# Enable Rewrite Engine
+    description: 'Apache Security Configuration',
+    code: `# API Verification System - Apache Config
 RewriteEngine On
-
-# Force HTTPS (uncomment in production)
-# RewriteCond %{HTTPS} off
-# RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+RewriteBase /
 
 # API Routes
 RewriteRule ^api/verify/?$ api/verify.php [L,QSA]
 RewriteRule ^api/license/?$ api/license.php [L,QSA]
 RewriteRule ^api/admin/?$ api/admin.php [L,QSA]
 
-# Security Headers
+# Security
+Options -Indexes
+
+<Files "config.php">
+    Require all denied
+</Files>
+
 <IfModule mod_headers.c>
     Header set X-Content-Type-Options "nosniff"
     Header set X-Frame-Options "DENY"
     Header set X-XSS-Protection "1; mode=block"
-    Header set Strict-Transport-Security "max-age=31536000; includeSubDomains"
 </IfModule>
 
-# Prevent directory listing
-Options -Indexes
-
-# Protect config file
-<Files "config.php">
-    Order Allow,Deny
-    Deny from all
-</Files>
-
-# Protect .env files
-<FilesMatch "^\\.env">
-    Order Allow,Deny
-    Deny from all
-</FilesMatch>
-
-# Rate limiting (if mod_ratelimit is available)
-<IfModule mod_ratelimit.c>
-    <Location /api/>
-        SetOutputFilter RATE_LIMIT
-        SetEnv rate-limit 500
-    </Location>
-</IfModule>
-
-# CORS for API
+# CORS
 <IfModule mod_headers.c>
-    SetEnvIf Origin "^(.*)$" ORIGIN=$1
     <FilesMatch "\\.(php)$">
-        Header set Access-Control-Allow-Origin "%{ORIGIN}e"
+        Header set Access-Control-Allow-Origin "*"
         Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
         Header set Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key"
-        Header set Access-Control-Max-Age "3600"
     </FilesMatch>
 </IfModule>`
+  },
+  {
+    id: 'readme',
+    name: 'README.md',
+    path: 'README.md',
+    icon: <FileText size={16} />,
+    description: 'Installation & Usage Guide',
+    code: `# API Verification System - PHP & MySQL
+
+## Installation
+
+1. Import database.sql into MySQL
+2. Update config.php with your DB credentials
+3. Upload files to your server
+4. Set permissions: chmod 755 logs/
+
+## API Endpoints
+
+### Verify API Key
+POST /api/verify
+Body: {"api_key": "ak_live_xxx"}
+
+### Verify License  
+POST /api/license
+Body: {"action": "verify", "license_key": "LIC-xxx", "device_id": "xxx"}
+
+### Admin Login
+POST /api/admin?action=login
+Body: {"email": "admin@site.com", "password": "xxx"}
+
+## Default Credentials
+- Email: admin@apiverify.com
+- Password: admin123
+
+## Requirements
+- PHP 7.4+
+- MySQL 5.7+
+- Apache with mod_rewrite`
   }
 ];
 
 export default function PhpCode() {
   const [activeFile, setActiveFile] = useState(phpFiles[0].id);
   const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState<'zip' | 'sql' | null>(null);
 
   const currentFile = phpFiles.find(f => f.id === activeFile)!;
 
@@ -883,35 +920,157 @@ export default function PhpCode() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const downloadSQL = async () => {
+    setDownloading('sql');
+    try {
+      const response = await fetch('/api_verification_database.sql');
+      const blob = await response.blob();
+      saveAs(blob, 'api_verification_database.sql');
+    } catch (error) {
+      alert('Failed to download SQL file');
+    }
+    setDownloading(null);
+  };
+
+  const downloadZIP = async () => {
+    setDownloading('zip');
+    try {
+      const zip = new JSZip();
+      const folder = zip.folder('api-verification-system');
+      
+      if (!folder) throw new Error('Failed to create ZIP folder');
+
+      // Add all PHP files
+      for (const file of phpFiles) {
+        folder.file(file.path, file.code);
+      }
+
+      // Add SQL file
+      const sqlResponse = await fetch('/api_verification_database.sql');
+      const sqlContent = await sqlResponse.text();
+      folder.file('database.sql', sqlContent);
+
+      // Generate ZIP
+      const content = await zip.generateAsync({ type: 'blob' });
+      saveAs(content, 'api-verification-system.zip');
+    } catch (error) {
+      console.error('ZIP error:', error);
+      alert('Failed to create ZIP file. Please try again.');
+    }
+    setDownloading(null);
+  };
+
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold text-white">PHP Backend Code</h1>
-          <p className="text-gray-400 mt-1">Complete PHP & MySQL source code for API Verification System</p>
+          <p className="text-gray-400 mt-1">Complete PHP & MySQL source code - Ready to deploy</p>
         </div>
-        <button className="btn-success flex items-center gap-2" onClick={copyCode}>
-          {copied ? <Check size={18} /> : <Copy size={18} />}
-          {copied ? 'Copied!' : 'Copy Code'}
-        </button>
+        <div className="flex gap-3">
+          <button 
+            className="btn-primary flex items-center gap-2" 
+            onClick={downloadSQL}
+            disabled={downloading !== null}
+          >
+            {downloading === 'sql' ? (
+              <span className="animate-spin">⏳</span>
+            ) : (
+              <Download size={18} />
+            )}
+            Download SQL
+          </button>
+          <button 
+            className="btn-success flex items-center gap-2" 
+            onClick={downloadZIP}
+            disabled={downloading !== null}
+          >
+            {downloading === 'zip' ? (
+              <span className="animate-spin">⏳</span>
+            ) : (
+              <FileArchive size={18} />
+            )}
+            Download ZIP
+          </button>
+        </div>
+      </div>
+
+      {/* Download Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="card bg-gradient-to-r from-blue-500/10 to-purple-500/10 border-blue-500/20 cursor-pointer hover:border-blue-400/40 transition-all" onClick={downloadSQL}>
+          <div className="flex items-center gap-4">
+            <div className="w-14 h-14 bg-blue-500/20 rounded-xl flex items-center justify-center">
+              <Database size={28} className="text-blue-400" />
+            </div>
+            <div className="flex-1">
+              <h3 className="text-white font-semibold text-lg">Database SQL File</h3>
+              <p className="text-gray-400 text-sm">Complete MySQL schema with tables, views, procedures & events</p>
+              <div className="flex items-center gap-2 mt-2">
+                <span className="badge bg-blue-500/20 text-blue-400">.sql</span>
+                <span className="text-xs text-gray-500">7 tables • 4 procedures • 3 events • 3 views</span>
+              </div>
+            </div>
+            <Download size={20} className="text-blue-400" />
+          </div>
+        </div>
+
+        <div className="card bg-gradient-to-r from-green-500/10 to-emerald-500/10 border-green-500/20 cursor-pointer hover:border-green-400/40 transition-all" onClick={downloadZIP}>
+          <div className="flex items-center gap-4">
+            <div className="w-14 h-14 bg-green-500/20 rounded-xl flex items-center justify-center">
+              <FileArchive size={28} className="text-green-400" />
+            </div>
+            <div className="flex-1">
+              <h3 className="text-white font-semibold text-lg">Complete Source ZIP</h3>
+              <p className="text-gray-400 text-sm">All PHP files + SQL + .htaccess + README</p>
+              <div className="flex items-center gap-2 mt-2">
+                <span className="badge bg-green-500/20 text-green-400">.zip</span>
+                <span className="text-xs text-gray-500">6 files • Ready to deploy</span>
+              </div>
+            </div>
+            <Download size={20} className="text-green-400" />
+          </div>
+        </div>
       </div>
 
       {/* Installation Guide */}
       <div className="card bg-blue-500/5 border-blue-500/20">
-        <h3 className="text-lg font-semibold text-blue-400 mb-2">📋 Installation Guide</h3>
-        <ol className="text-sm text-gray-300 space-y-1 list-decimal list-inside">
-          <li>Create MySQL database using the SQL schema</li>
-          <li>Update <code className="bg-gray-700 px-1 rounded">config.php</code> with your database credentials</li>
-          <li>Upload all PHP files to your server</li>
-          <li>Configure Apache with the .htaccess file</li>
-          <li>Test the API endpoints</li>
-        </ol>
+        <h3 className="text-lg font-semibold text-blue-400 mb-3">📋 Quick Installation Guide</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <div className="flex items-start gap-2">
+              <span className="w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center text-xs text-white flex-shrink-0">1</span>
+              <p className="text-sm text-gray-300">Download the ZIP file and extract it</p>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center text-xs text-white flex-shrink-0">2</span>
+              <p className="text-sm text-gray-300">Import <code className="bg-gray-700 px-1 rounded text-xs">database.sql</code> into MySQL</p>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center text-xs text-white flex-shrink-0">3</span>
+              <p className="text-sm text-gray-300">Edit <code className="bg-gray-700 px-1 rounded text-xs">config.php</code> with your DB credentials</p>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-start gap-2">
+              <span className="w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center text-xs text-white flex-shrink-0">4</span>
+              <p className="text-sm text-gray-300">Upload files to your web server</p>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center text-xs text-white flex-shrink-0">5</span>
+              <p className="text-sm text-gray-300">Set permissions: <code className="bg-gray-700 px-1 rounded text-xs">chmod 755 logs/</code></p>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="w-6 h-6 bg-blue-600 rounded-full flex items-center justify-center text-xs text-white flex-shrink-0">6</span>
+              <p className="text-sm text-gray-300">Login: admin@apiverify.com / admin123</p>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         {/* File List */}
         <div className="lg:col-span-1 space-y-2">
-          <h3 className="text-sm font-medium text-gray-400 mb-3">FILES</h3>
+          <h3 className="text-sm font-medium text-gray-400 mb-3">SOURCE FILES</h3>
           {phpFiles.map((file) => (
             <div
               key={file.id}
@@ -930,19 +1089,19 @@ export default function PhpCode() {
         {/* Code Display */}
         <div className="lg:col-span-3">
           <div className="card p-0 overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-3 bg-gray-750 border-b border-gray-700">
+            <div className="flex items-center justify-between px-4 py-3 bg-gray-900 border-b border-gray-700">
               <div className="flex items-center gap-2">
                 <div className="w-3 h-3 rounded-full bg-red-500" />
                 <div className="w-3 h-3 rounded-full bg-yellow-500" />
                 <div className="w-3 h-3 rounded-full bg-green-500" />
                 <span className="ml-2 text-sm text-gray-400">{currentFile.name}</span>
               </div>
-              <button onClick={copyCode} className="text-gray-400 hover:text-white text-sm flex items-center gap-1">
-                {copied ? <Check size={14} /> : <Copy size={14} />}
-                {copied ? 'Copied' : 'Copy'}
+              <button onClick={copyCode} className="text-gray-400 hover:text-white text-sm flex items-center gap-1 px-2 py-1 rounded hover:bg-gray-700">
+                {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                {copied ? 'Copied!' : 'Copy'}
               </button>
             </div>
-            <pre className="p-4 overflow-x-auto text-sm text-gray-300 max-h-[600px] overflow-y-auto">
+            <pre className="p-4 overflow-x-auto text-sm text-gray-300 max-h-[600px] overflow-y-auto bg-gray-900">
               <code>{currentFile.code}</code>
             </pre>
           </div>
