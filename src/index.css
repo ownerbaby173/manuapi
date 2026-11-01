@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply bg-gray-900 text-white;
+  }
+}
+
+@layer components {
+  .sidebar-link {
+    @apply flex items-center gap-3 px-4 py-3 rounded-lg text-gray-300 hover:bg-gray-700/50 hover:text-white transition-all duration-200 cursor-pointer;
+  }
+  .sidebar-link.active {
+    @apply bg-blue-600/20 text-blue-400 border-r-2 border-blue-400;
+  }
+  .card {
+    @apply bg-gray-800 border border-gray-700 rounded-xl p-6;
+  }
+  .btn-primary {
+    @apply bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium transition-all duration-200;
+  }
+  .btn-danger {
+    @apply bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-medium transition-all duration-200;
+  }
+  .btn-success {
+    @apply bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-medium transition-all duration-200;
+  }
+  .input-field {
+    @apply w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent;
+  }
+  .badge {
+    @apply px-2 py-1 rounded-full text-xs font-medium;
+  }
+  .badge-active {
+    @apply bg-green-500/20 text-green-400;
+  }
+  .badge-inactive {
+    @apply bg-red-500/20 text-red-400;
+  }
+  .badge-expired {
+    @apply bg-yellow-500/20 text-yellow-400;
+  }
+  .table-row {
+    @apply border-b border-gray-700 hover:bg-gray-700/30 transition-colors;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #1f2937;
+}
+::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #6b7280;
+}
